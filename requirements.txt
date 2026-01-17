@@ -1,0 +1,7 @@
+torch
+pyttsx3
+spacy
+fuzzywuzzy
+python-Levenshtein
+scikit-learn
+transformers

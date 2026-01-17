@@ -1,0 +1,258 @@
+[
+  {
+    "text": "hello",
+    "intent": "greet"
+  },
+  {
+    "text": "hi",
+    "intent": "greet"
+  },
+  {
+    "text": "hey",
+    "intent": "greet"
+  },
+  {
+    "text": "good morning",
+    "intent": "greet"
+  },
+  {
+    "text": "good afternoon",
+    "intent": "greet"
+  },
+  {
+    "text": "good evening",
+    "intent": "greet"
+  },
+  {
+    "text": "how are you",
+    "intent": "greet"
+  },
+  {
+    "text": "what's up",
+    "intent": "greet"
+  },
+  {
+    "text": "bye",
+    "intent": "exit"
+  },
+  {
+    "text": "goodbye",
+    "intent": "exit"
+  },
+  {
+    "text": "exit",
+    "intent": "exit"
+  },
+  {
+    "text": "quit",
+    "intent": "exit"
+  },
+  {
+    "text": "see you later",
+    "intent": "exit"
+  },
+  {
+    "text": "farewell",
+    "intent": "exit"
+  },
+  {
+    "text": "what time is it",
+    "intent": "time"
+  },
+  {
+    "text": "tell me the time",
+    "intent": "time"
+  },
+  {
+    "text": "current time",
+    "intent": "time"
+  },
+  {
+    "text": "can you tell me the time",
+    "intent": "time"
+  },
+  {
+    "text": "do you know the time",
+    "intent": "time"
+  },
+  {
+    "text": "what is the date today",
+    "intent": "date"
+  },
+  {
+    "text": "tell me the date",
+    "intent": "date"
+  },
+  {
+    "text": "current date",
+    "intent": "date"
+  },
+  {
+    "text": "today's date",
+    "intent": "date"
+  },
+  {
+    "text": "can you tell me the date",
+    "intent": "date"
+  },
+  {
+    "text": "tell me a joke",
+    "intent": "joke"
+  },
+  {
+    "text": "make me laugh",
+    "intent": "joke"
+  },
+  {
+    "text": "say something funny",
+    "intent": "joke"
+  },
+  {
+    "text": "do you know any jokes",
+    "intent": "joke"
+  },
+  {
+    "text": "joke please",
+    "intent": "joke"
+  },
+  {
+    "text": "open notepad",
+    "intent": "open_notepad"
+  },
+  {
+    "text": "start notepad",
+    "intent": "open_notepad"
+  },
+  {
+    "text": "launch notepad",
+    "intent": "open_notepad"
+  },
+  {
+    "text": "open calculator",
+    "intent": "open_calculator"
+  },
+  {
+    "text": "start calculator",
+    "intent": "open_calculator"
+  },
+  {
+    "text": "launch calculator",
+    "intent": "open_calculator"
+  },
+  {
+    "text": "open whatsapp",
+    "intent": "open_whatsapp"
+  },
+  {
+    "text": "launch whatsapp",
+    "intent": "open_whatsapp"
+  },
+  {
+    "text": "start whatsapp",
+    "intent": "open_whatsapp"
+  },
+  {
+    "text": "thank you",
+    "intent": "thanks"
+  },
+  {
+    "text": "thanks",
+    "intent": "thanks"
+  },
+  {
+    "text": "appreciate it",
+    "intent": "thanks"
+  },
+  {
+    "text": "open whatsapp",
+    "intent": "open_app"
+  },
+  {
+    "text": "open whatsapp",
+    "intent": "open_app"
+  },
+  {
+    "text": "open whatapp",
+    "intent": "open_app"
+  },
+  {
+    "text": "open whatsapp",
+    "intent": "open_app"
+  },
+  {
+    "text": "open whatsapp",
+    "intent": "open_app"
+  },
+  {
+    "text": "whatsapp",
+    "intent": "open_app"
+  },
+  {
+    "text": "whatsapp",
+    "intent": "open_app"
+  },
+  {
+    "text": "notepad",
+    "intent": "open_app"
+  },
+  {
+    "text": "open notepad",
+    "intent": "open_app"
+  },
+  {
+    "text": "i want to write something",
+    "intent": "open_app"
+  },
+  {
+    "text": "i'm sad",
+    "intent": "mood"
+  },
+  {
+    "text": "feeling bad",
+    "intent": "mood"
+  },
+  {
+    "text": "i am happy",
+    "intent": "mood"
+  },
+  {
+    "text": "i feel depressed",
+    "intent": "mood"
+  },
+  {
+    "text": "i am excited",
+    "intent": "mood"
+  },
+  {
+    "text": "i am frustrated",
+    "intent": "mood"
+  },
+  {
+    "text": "i am angry",
+    "intent": "mood"
+  },
+  {
+    "text": "i am lonely",
+    "intent": "mood"
+  },
+  {
+    "text": "i feel a bit sad",
+    "intent": "mood"
+  },
+  {
+  "text": "I'm feeling sad",
+  "intent": "emotion"
+},
+{
+  "text": "I'm really happy today",
+  "intent": "emotion"
+},
+{
+  "text": "I'm not okay",
+  "intent": "emotion"
+},
+{
+  "text": "I'm feeling great",
+  "intent": "emotion"
+}
+]

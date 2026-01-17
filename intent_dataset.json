@@ -1,0 +1,40 @@
+{
+  "intents": [
+    {
+      "text": "open notepad",
+      "intent": "open_app"
+    },
+    {
+      "text": "open whatsapp",
+      "intent": "open_app"
+    },
+    {
+      "text": "what time is it",
+      "intent": "time"
+    },
+    {
+      "text": "tell me a joke",
+      "intent": "joke"
+    },
+    {
+      "text": "hello",
+      "intent": "greet"
+    },
+    {
+      "text": "exit",
+      "intent": "exit"
+    },
+    {
+      "text": "date",
+      "intent": "date"
+    },
+    {
+      "text": "open app brave",
+      "intent": "open_app"
+    },
+    {
+      "text": "brave",
+      "intent": "open_app"
+    }
+  ]
+}
