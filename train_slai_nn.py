@@ -96,10 +96,15 @@ def is_high_quality_pair(instruction, response, min_alpha_ratio=0.45, max_chars=
     return ratio >= float(min_alpha_ratio)
 
 
-def add_pair(rows, instruction, response, source):
+def add_pair(rows, instruction, response, source, min_alpha_ratio=0.45, max_chars=900):
     instruction = clean_text(instruction)
     response = clean_text(response)
-    if not is_high_quality_pair(instruction, response):
+    if not is_high_quality_pair(
+        instruction,
+        response,
+        min_alpha_ratio=min_alpha_ratio,
+        max_chars=max_chars,
+    ):
         return
     rows.append(
         {
@@ -123,7 +128,14 @@ def load_from_hf(args):
         reply = clean_text(item.get("output", ""))
         if context:
             prompt = f"{prompt}\nContext: {context}"
-        add_pair(rows, prompt, reply, "dolly15k")
+        add_pair(
+            rows,
+            prompt,
+            reply,
+            "dolly15k",
+            min_alpha_ratio=args.quality_min_alpha_ratio,
+            max_chars=args.quality_max_chars,
+        )
         dolly_count += 1
         if dolly_count >= args.max_per_dataset:
             break
@@ -136,7 +148,14 @@ def load_from_hf(args):
         coherence = float(item.get("coherence", 0))
         if min(helpfulness, correctness, coherence) < args.helpsteer_min_score:
             continue
-        add_pair(rows, item.get("prompt", ""), item.get("response", ""), "helpsteer2")
+        add_pair(
+            rows,
+            item.get("prompt", ""),
+            item.get("response", ""),
+            "helpsteer2",
+            min_alpha_ratio=args.quality_min_alpha_ratio,
+            max_chars=args.quality_max_chars,
+        )
         hs_count += 1
         if hs_count >= args.max_per_dataset:
             break
@@ -169,7 +188,14 @@ def load_from_hf(args):
         parent_id = item.get("parent_id")
         prompt_text = prompt_by_id.get(parent_id, "")
         reply_text = clean_text(item.get("text", ""))
-        add_pair(rows, prompt_text, reply_text, "oasst1")
+        add_pair(
+            rows,
+            prompt_text,
+            reply_text,
+            "oasst1",
+            min_alpha_ratio=args.quality_min_alpha_ratio,
+            max_chars=args.quality_max_chars,
+        )
         oa_count += 1
         if oa_count >= args.max_per_dataset:
             break
@@ -177,7 +203,7 @@ def load_from_hf(args):
     return rows
 
 
-def load_local_jsonl(path, source):
+def load_local_jsonl(path, source, min_alpha_ratio=0.45, max_chars=900, max_rows=0):
     path = Path(path)
     if not path.exists():
         return []
@@ -193,7 +219,16 @@ def load_local_jsonl(path, source):
                 continue
             instruction = item.get("instruction") or item.get("prompt") or item.get("user_input")
             response = item.get("response") or item.get("output") or item.get("final_reply")
-            add_pair(rows, instruction, response, source)
+            add_pair(
+                rows,
+                instruction,
+                response,
+                source,
+                min_alpha_ratio=min_alpha_ratio,
+                max_chars=max_chars,
+            )
+            if max_rows > 0 and len(rows) >= max_rows:
+                break
     return rows
 
 
@@ -297,49 +332,6 @@ def load_compatible_state(model, checkpoint_state):
     return len(compatible), skipped
 
 
-def write_live_node_snapshot(
-    model,
-    sample_x,
-    output_path,
-    epoch,
-    step,
-    avg_loss,
-    max_nodes=128,
-):
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    with torch.no_grad():
-        emb = model.embedding(sample_x)
-        out, _ = model.rnn(emb)
-        last_hidden = model.norm(out[:, -1, :]).squeeze(0).detach().float().cpu()
-        proj_norm = model.proj.weight.detach().float().cpu().norm(dim=0)
-
-    node_count = max(8, min(int(max_nodes), int(last_hidden.shape[0]), int(proj_norm.shape[0])))
-    x_axis = list(range(node_count))
-    hidden_vals = last_hidden[:node_count].tolist()
-    proj_vals = proj_norm[:node_count].tolist()
-
-    fig, axes = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
-    fig.suptitle(f"SLAI Live Node View | epoch={epoch} step={step} avg_loss={avg_loss:.4f}")
-
-    axes[0].plot(x_axis, hidden_vals, linewidth=1.2)
-    axes[0].set_ylabel("Hidden Activation")
-    axes[0].grid(True, alpha=0.25)
-
-    axes[1].plot(x_axis, proj_vals, linewidth=1.2)
-    axes[1].set_ylabel("Proj Weight Norm")
-    axes[1].set_xlabel(f"Node Index (first {node_count})")
-    axes[1].grid(True, alpha=0.25)
-
-    fig.tight_layout()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=130)
-    plt.close(fig)
-
-
 def train(args):
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -355,9 +347,42 @@ def train(args):
         except Exception as exc:
             print(f"[dataset] Internet dataset load failed: {exc}")
 
-    rows.extend(load_local_jsonl("data/slai_sft_train.jsonl", "local_sft_train"))
-    rows.extend(load_local_jsonl("data/slai_sft_valid.jsonl", "local_sft_valid"))
-    rows.extend(load_local_jsonl("slai_feedback_log.jsonl", "feedback"))
+    rows.extend(
+        load_local_jsonl(
+            "data/slai_sft_train.jsonl",
+            "local_sft_train",
+            min_alpha_ratio=args.quality_min_alpha_ratio,
+            max_chars=args.quality_max_chars,
+            max_rows=args.max_local_train_rows,
+        )
+    )
+    rows.extend(
+        load_local_jsonl(
+            "data/slai_sft_valid.jsonl",
+            "local_sft_valid",
+            min_alpha_ratio=args.quality_min_alpha_ratio,
+            max_chars=args.quality_max_chars,
+            max_rows=args.max_local_valid_rows,
+        )
+    )
+    rows.extend(
+        load_local_jsonl(
+            "slai_feedback_log.jsonl",
+            "feedback",
+            min_alpha_ratio=args.quality_min_alpha_ratio,
+            max_chars=args.quality_max_chars,
+            max_rows=args.max_feedback_rows,
+        )
+    )
+    rows.extend(
+        load_local_jsonl(
+            "self_learning_memory.jsonl",
+            "self_learning",
+            min_alpha_ratio=args.quality_min_alpha_ratio,
+            max_chars=args.quality_max_chars,
+            max_rows=args.max_self_learning_rows,
+        )
+    )
 
     rows = dedupe(rows)
     if args.max_local_rows > 0:
@@ -500,8 +525,6 @@ def train(args):
     best_epoch = -1
     no_improve_epochs = 0
     stop_reason = ""
-    live_nodes_enabled = bool(args.live_nodes)
-    live_nodes_path = Path(args.live_nodes_file).resolve() if args.live_nodes_file else (output_dir / "live_nodes.png")
     stop_after_epoch = False
 
     # Initialize best metrics from existing best checkpoint when available.
@@ -588,23 +611,6 @@ def train(args):
                     }
                     torch.save(payload, interim_model_path)
                     print(f"[train] interim checkpoint saved at epoch={epoch} step={steps}", flush=True)
-                if live_nodes_enabled and steps % max(1, args.live_nodes_every_steps) == 0:
-                    try:
-                        sample_x = x[:1].detach()
-                        write_live_node_snapshot(
-                            model=model,
-                            sample_x=sample_x,
-                            output_path=live_nodes_path,
-                            epoch=epoch,
-                            step=steps,
-                            avg_loss=(running / max(1, steps)),
-                            max_nodes=args.live_nodes_max_nodes,
-                        )
-                        print(f"[train] live node snapshot -> {live_nodes_path}", flush=True)
-                    except Exception as exc:
-                        print(f"[train] live node snapshot disabled due to error: {exc}", flush=True)
-                        live_nodes_enabled = False
-
             train_loss = running / max(1, steps)
             last_train_loss = train_loss
             valid_loss = evaluate(model, valid_loader, device)
@@ -707,7 +713,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train SLAI local NN (GRU) from internet datasets + local logs.")
     parser.add_argument("--output-dir", default="artifacts/slai_nn")
     parser.add_argument("--max-per-dataset", type=int, default=3000)
+    parser.add_argument("--max-local-train-rows", type=int, default=0, help="Cap rows loaded from data/slai_sft_train.jsonl (0 means no cap).")
+    parser.add_argument("--max-local-valid-rows", type=int, default=0, help="Cap rows loaded from data/slai_sft_valid.jsonl (0 means no cap).")
+    parser.add_argument("--max-feedback-rows", type=int, default=0, help="Cap rows loaded from slai_feedback_log.jsonl (0 means no cap).")
+    parser.add_argument("--max-self-learning-rows", type=int, default=0, help="Cap rows loaded from self_learning_memory.jsonl (0 means no cap).")
     parser.add_argument("--helpsteer-min-score", type=float, default=3.0)
+    parser.add_argument("--quality-min-alpha-ratio", type=float, default=0.45, help="Lower to keep more multilingual/noisy samples.")
+    parser.add_argument("--quality-max-chars", type=int, default=900, help="Max chars per instruction/response pair.")
     parser.add_argument("--valid-ratio", type=float, default=0.05)
     parser.add_argument("--profile", choices=["balanced", "2b_like"], default="balanced")
     parser.add_argument("--seq-len", type=int, default=192)
@@ -729,10 +741,6 @@ def parse_args():
     parser.add_argument("--repetition-penalty", type=float, default=1.1)
     parser.add_argument("--log-every-steps", type=int, default=120)
     parser.add_argument("--save-every-steps", type=int, default=500)
-    parser.add_argument("--live-nodes", action="store_true", help="Write live node visualization PNG during training.")
-    parser.add_argument("--live-nodes-every-steps", type=int, default=400, help="Steps interval for live node snapshot.")
-    parser.add_argument("--live-nodes-max-nodes", type=int, default=128, help="How many nodes to display in live snapshot.")
-    parser.add_argument("--live-nodes-file", default="", help="Optional PNG path for live node snapshot.")
     parser.add_argument("--target-train-loss", type=float, default=None, help="Early-stop when running avg_loss <= this value.")
     parser.add_argument("--target-valid-loss", type=float, default=None, help="Early-stop when epoch valid_loss <= this value.")
     parser.add_argument("--early-stop-patience", type=int, default=0, help="Stop if valid loss does not improve for N epochs (0 disables).")
