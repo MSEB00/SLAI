@@ -502,6 +502,7 @@ def train(args):
     stop_reason = ""
     live_nodes_enabled = bool(args.live_nodes)
     live_nodes_path = Path(args.live_nodes_file).resolve() if args.live_nodes_file else (output_dir / "live_nodes.png")
+    stop_after_epoch = False
 
     # Initialize best metrics from existing best checkpoint when available.
     best_source = best_model_path if best_model_path.exists() else model_path
@@ -576,6 +577,7 @@ def train(args):
                     ):
                         stop_reason = f"target_train_loss_reached({avg:.4f}<={args.target_train_loss})"
                         print(f"[train] early stop triggered: {stop_reason}")
+                        stop_after_epoch = True
                         break
                 if steps % max(1, args.save_every_steps) == 0:
                     payload = {
@@ -656,6 +658,9 @@ def train(args):
             ):
                 stop_reason = f"target_valid_loss_reached({valid_loss:.4f}<={args.target_valid_loss})"
                 print(f"[train] early stop triggered: {stop_reason}")
+                break
+            if stop_after_epoch:
+                print("[train] stopping run after train-loss target was reached.")
                 break
 
             if (
