@@ -1,0 +1,10 @@
+[user]
+    name = Your Name
+    email = you@example.com
+
+[init]
+    defaultBranch = main
+
+[core]
+    autocrlf = true
+

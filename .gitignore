@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+*.coverage
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Build / packaging
+build/
+dist/
+*.spec
+
+# Runtime state and local memory
+memory.json
+reminders.json
+cognitive_state.json
+self_learning_memory.jsonl
+slai_feedback_log.jsonl
+
+# Training outputs
+artifacts/
+outputs/
+data/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.bin
+
+# Training logs and plots
+*.log
+*.jsonl
+*.png
+

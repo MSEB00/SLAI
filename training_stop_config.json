@@ -1,0 +1,8 @@
+{
+  "training": {
+    "target_train_loss": 0.35,
+    "target_valid_loss": 2.0,
+    "early_stop_patience": 2,
+    "min_epochs_before_stop": 1
+  }
+}
