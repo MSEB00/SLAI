@@ -2,6 +2,7 @@ import argparse
 import json
 import random
 import re
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -424,6 +425,8 @@ def train(args):
     write_pairs_jsonl(output_dir / "pairs.jsonl", train_rows)
 
     model_path = output_dir / "model.pt"
+    interim_model_path = output_dir / "model_interim.pt"
+    best_model_path = output_dir / "model_best.pt"
     summary_path = output_dir / "train_summary.json"
     metrics_path = output_dir / "train_metrics.jsonl"
 
@@ -500,165 +503,181 @@ def train(args):
     live_nodes_enabled = bool(args.live_nodes)
     live_nodes_path = Path(args.live_nodes_file).resolve() if args.live_nodes_file else (output_dir / "live_nodes.png")
 
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        running = 0.0
-        steps = 0
-        optimizer.zero_grad(set_to_none=True)
-        for x, y in train_loader:
-            x = x.to(device)
-            y = y.to(device)
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                logits, _ = model(x)
-                loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), y.reshape(-1), ignore_index=0)
-                loss = loss / max(1, args.grad_accum_steps)
+    # Initialize best metrics from existing best checkpoint when available.
+    best_source = best_model_path if best_model_path.exists() else model_path
+    if best_source.exists():
+        try:
+            previous_best = torch.load(best_source, map_location="cpu")
+            prev_valid = previous_best.get("valid_loss")
+            prev_epoch = previous_best.get("epoch")
+            if isinstance(prev_valid, (int, float)):
+                best_valid = float(prev_valid)
+                if isinstance(prev_epoch, int):
+                    best_epoch = int(prev_epoch)
+                print(f"[train] baseline best loaded from {best_source.name}: epoch={best_epoch}, valid_loss={best_valid:.4f}")
+        except Exception:
+            pass
 
-            scaler.scale(loss).backward()
-            if (steps + 1) % max(1, args.grad_accum_steps) == 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
+    interrupted = False
+    last_epoch = 0
+    last_step = 0
+    last_train_loss = None
+    last_valid_loss = None
+    try:
+        for epoch in range(1, args.epochs + 1):
+            last_epoch = epoch
+            model.train()
+            running = 0.0
+            steps = 0
+            optimizer.zero_grad(set_to_none=True)
+            for x, y in train_loader:
+                x = x.to(device)
+                y = y.to(device)
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    logits, _ = model(x)
+                    loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), y.reshape(-1), ignore_index=0)
+                    loss = loss / max(1, args.grad_accum_steps)
 
-            running += float(loss.item()) * max(1, args.grad_accum_steps)
-            steps += 1
-            if steps % max(1, args.log_every_steps) == 0:
-                avg = running / max(1, steps)
-                print(f"[train] epoch={epoch} step={steps} avg_loss={avg:.4f}", flush=True)
-                append_metric(
-                    "step",
-                    {
-                        "epoch": epoch,
-                        "step": steps,
-                        "avg_loss": avg,
-                    },
-                )
-                write_running_summary(
-                    status="running",
-                    epoch_idx=epoch,
-                    step_idx=steps,
-                    train_loss_value=avg,
-                    valid_loss_value=None,
-                    best_epoch_value=best_epoch if best_epoch > 0 else None,
-                    best_valid_value=None if best_valid == float("inf") else best_valid,
-                )
-                if (
-                    args.target_train_loss is not None
-                    and epoch >= args.min_epochs_before_stop
-                    and avg <= float(args.target_train_loss)
-                ):
-                    stop_reason = f"target_train_loss_reached({avg:.4f}<={args.target_train_loss})"
-                    print(f"[train] early stop triggered: {stop_reason}")
+                scaler.scale(loss).backward()
+                if (steps + 1) % max(1, args.grad_accum_steps) == 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+
+                running += float(loss.item()) * max(1, args.grad_accum_steps)
+                steps += 1
+                last_step = steps
+                if steps % max(1, args.log_every_steps) == 0:
+                    avg = running / max(1, steps)
+                    print(f"[train] epoch={epoch} step={steps} avg_loss={avg:.4f}", flush=True)
+                    append_metric(
+                        "step",
+                        {
+                            "epoch": epoch,
+                            "step": steps,
+                            "avg_loss": avg,
+                        },
+                    )
                     write_running_summary(
-                        status="stopped_early",
+                        status="running",
                         epoch_idx=epoch,
                         step_idx=steps,
                         train_loss_value=avg,
                         valid_loss_value=None,
                         best_epoch_value=best_epoch if best_epoch > 0 else None,
-                        best_valid_value=None if best_valid == float('inf') else best_valid,
-                        stop_reason=stop_reason,
+                        best_valid_value=None if best_valid == float("inf") else best_valid,
                     )
-                    metadata = {
-                        "best_epoch": best_epoch,
-                        "best_valid_loss": best_valid,
-                        "device": str(device),
-                        "rows_total": len(rows),
-                        "rows_train": len(train_rows),
-                        "rows_valid": len(valid_rows),
-                        "stopped_early": True,
-                        "stop_reason": stop_reason,
+                    if (
+                        args.target_train_loss is not None
+                        and epoch >= args.min_epochs_before_stop
+                        and avg <= float(args.target_train_loss)
+                    ):
+                        stop_reason = f"target_train_loss_reached({avg:.4f}<={args.target_train_loss})"
+                        print(f"[train] early stop triggered: {stop_reason}")
+                        break
+                if steps % max(1, args.save_every_steps) == 0:
+                    payload = {
+                        "model_state": model.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "epoch": epoch,
+                        "valid_loss": None,
                     }
-                    summary_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-                    print(f"[done] artifacts written to: {output_dir}")
-                    return
-            if steps % max(1, args.save_every_steps) == 0:
+                    torch.save(payload, interim_model_path)
+                    print(f"[train] interim checkpoint saved at epoch={epoch} step={steps}", flush=True)
+                if live_nodes_enabled and steps % max(1, args.live_nodes_every_steps) == 0:
+                    try:
+                        sample_x = x[:1].detach()
+                        write_live_node_snapshot(
+                            model=model,
+                            sample_x=sample_x,
+                            output_path=live_nodes_path,
+                            epoch=epoch,
+                            step=steps,
+                            avg_loss=(running / max(1, steps)),
+                            max_nodes=args.live_nodes_max_nodes,
+                        )
+                        print(f"[train] live node snapshot -> {live_nodes_path}", flush=True)
+                    except Exception as exc:
+                        print(f"[train] live node snapshot disabled due to error: {exc}", flush=True)
+                        live_nodes_enabled = False
+
+            train_loss = running / max(1, steps)
+            last_train_loss = train_loss
+            valid_loss = evaluate(model, valid_loader, device)
+            last_valid_loss = valid_loss
+            scheduler.step()
+            ppl = float(torch.exp(torch.tensor(valid_loss)).item()) if valid_loss < 20 else float("inf")
+            print(
+                f"[train] epoch={epoch}/{args.epochs} train_loss={train_loss:.4f} "
+                f"valid_loss={valid_loss:.4f} valid_ppl={ppl:.2f}"
+            )
+            append_metric(
+                "epoch",
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "valid_loss": valid_loss,
+                    "valid_ppl": ppl,
+                },
+            )
+
+            if valid_loss < best_valid:
+                best_valid = valid_loss
+                best_epoch = epoch
+                no_improve_epochs = 0
                 payload = {
                     "model_state": model.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "epoch": epoch,
-                    "valid_loss": None,
+                    "valid_loss": valid_loss,
                 }
-                torch.save(payload, output_dir / "model.pt")
-                print(f"[train] interim checkpoint saved at epoch={epoch} step={steps}", flush=True)
-            if live_nodes_enabled and steps % max(1, args.live_nodes_every_steps) == 0:
-                try:
-                    sample_x = x[:1].detach()
-                    write_live_node_snapshot(
-                        model=model,
-                        sample_x=sample_x,
-                        output_path=live_nodes_path,
-                        epoch=epoch,
-                        step=steps,
-                        avg_loss=(running / max(1, steps)),
-                        max_nodes=args.live_nodes_max_nodes,
-                    )
-                    print(f"[train] live node snapshot -> {live_nodes_path}", flush=True)
-                except Exception as exc:
-                    print(f"[train] live node snapshot disabled due to error: {exc}", flush=True)
-                    live_nodes_enabled = False
+                torch.save(payload, model_path)
+                torch.save(payload, best_model_path)
+                print(f"[train] saved best model at epoch {epoch} -> {model_path}")
+            else:
+                no_improve_epochs += 1
 
-        train_loss = running / max(1, steps)
-        valid_loss = evaluate(model, valid_loader, device)
-        scheduler.step()
-        ppl = float(torch.exp(torch.tensor(valid_loss)).item()) if valid_loss < 20 else float("inf")
-        print(
-            f"[train] epoch={epoch}/{args.epochs} train_loss={train_loss:.4f} "
-            f"valid_loss={valid_loss:.4f} valid_ppl={ppl:.2f}"
-        )
-        append_metric(
-            "epoch",
-            {
-                "epoch": epoch,
-                "train_loss": train_loss,
-                "valid_loss": valid_loss,
-                "valid_ppl": ppl,
-            },
-        )
+            write_running_summary(
+                status="running",
+                epoch_idx=epoch,
+                step_idx=steps,
+                train_loss_value=train_loss,
+                valid_loss_value=valid_loss,
+                best_epoch_value=best_epoch if best_epoch > 0 else None,
+                best_valid_value=None if best_valid == float("inf") else best_valid,
+            )
 
-        if valid_loss < best_valid:
-            best_valid = valid_loss
-            best_epoch = epoch
-            no_improve_epochs = 0
-            payload = {
-                "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "epoch": epoch,
-                "valid_loss": valid_loss,
-            }
-            torch.save(payload, output_dir / "model.pt")
-            print(f"[train] saved best model at epoch {epoch} -> {output_dir / 'model.pt'}")
-        else:
-            no_improve_epochs += 1
+            if (
+                args.target_valid_loss is not None
+                and epoch >= args.min_epochs_before_stop
+                and valid_loss <= float(args.target_valid_loss)
+            ):
+                stop_reason = f"target_valid_loss_reached({valid_loss:.4f}<={args.target_valid_loss})"
+                print(f"[train] early stop triggered: {stop_reason}")
+                break
 
-        write_running_summary(
-            status="running",
-            epoch_idx=epoch,
-            step_idx=steps,
-            train_loss_value=train_loss,
-            valid_loss_value=valid_loss,
-            best_epoch_value=best_epoch if best_epoch > 0 else None,
-            best_valid_value=None if best_valid == float("inf") else best_valid,
-        )
-
-        if (
-            args.target_valid_loss is not None
-            and epoch >= args.min_epochs_before_stop
-            and valid_loss <= float(args.target_valid_loss)
-        ):
-            stop_reason = f"target_valid_loss_reached({valid_loss:.4f}<={args.target_valid_loss})"
-            print(f"[train] early stop triggered: {stop_reason}")
-            break
-
-        if (
-            args.early_stop_patience > 0
-            and epoch >= args.min_epochs_before_stop
-            and no_improve_epochs >= int(args.early_stop_patience)
-        ):
-            stop_reason = f"no_improvement_for_{no_improve_epochs}_epochs"
-            print(f"[train] early stop triggered: {stop_reason}")
-            break
+            if (
+                args.early_stop_patience > 0
+                and epoch >= args.min_epochs_before_stop
+                and no_improve_epochs >= int(args.early_stop_patience)
+            ):
+                stop_reason = f"no_improvement_for_{no_improve_epochs}_epochs"
+                print(f"[train] early stop triggered: {stop_reason}")
+                break
+    except KeyboardInterrupt:
+        interrupted = True
+        stop_reason = "keyboard_interrupt"
+        print("[train] interrupted by user (KeyboardInterrupt).")
+    finally:
+        # Ensure model.pt points to best-known checkpoint even after interruption.
+        if best_model_path.exists():
+            try:
+                shutil.copy2(best_model_path, model_path)
+                print(f"[train] restored best checkpoint to {model_path.name} from {best_model_path.name}")
+            except Exception as exc:
+                print(f"[train] warning: failed to restore best checkpoint: {exc}")
 
     metadata = {
         "best_epoch": best_epoch,
@@ -667,7 +686,12 @@ def train(args):
         "rows_total": len(rows),
         "rows_train": len(train_rows),
         "rows_valid": len(valid_rows),
-        "stopped_early": bool(stop_reason),
+        "last_epoch": last_epoch,
+        "last_step": last_step,
+        "last_train_loss": last_train_loss,
+        "last_valid_loss": last_valid_loss,
+        "interrupted": interrupted,
+        "stopped_early": bool(stop_reason and not interrupted),
         "stop_reason": stop_reason,
     }
     summary_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
