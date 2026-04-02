@@ -332,6 +332,20 @@ def load_compatible_state(model, checkpoint_state):
     return len(compatible), skipped
 
 
+def checkpoint_compatibility(model, checkpoint_state):
+    model_state = model.state_dict()
+    total = len(model_state)
+    matched = 0
+    for key, value in checkpoint_state.items():
+        if key not in model_state:
+            continue
+        if tuple(value.shape) != tuple(model_state[key].shape):
+            continue
+        matched += 1
+    ratio = (matched / total) if total else 0.0
+    return matched, total, ratio
+
+
 def train(args):
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -339,52 +353,66 @@ def train(args):
         torch.cuda.manual_seed_all(args.seed)
 
     rows = []
+    source_counts = {}
     internet_ok = False
     if not args.skip_internet:
         try:
-            rows.extend(load_from_hf(args))
+            hf_rows = load_from_hf(args)
+            rows.extend(hf_rows)
+            source_counts["internet_hf"] = len(hf_rows)
             internet_ok = True
         except Exception as exc:
             print(f"[dataset] Internet dataset load failed: {exc}")
 
-    rows.extend(
-        load_local_jsonl(
-            "data/slai_sft_train.jsonl",
-            "local_sft_train",
-            min_alpha_ratio=args.quality_min_alpha_ratio,
-            max_chars=args.quality_max_chars,
-            max_rows=args.max_local_train_rows,
-        )
+    local_train_rows = load_local_jsonl(
+        "data/slai_sft_train.jsonl",
+        "local_sft_train",
+        min_alpha_ratio=args.quality_min_alpha_ratio,
+        max_chars=args.quality_max_chars,
+        max_rows=args.max_local_train_rows,
     )
-    rows.extend(
-        load_local_jsonl(
-            "data/slai_sft_valid.jsonl",
-            "local_sft_valid",
-            min_alpha_ratio=args.quality_min_alpha_ratio,
-            max_chars=args.quality_max_chars,
-            max_rows=args.max_local_valid_rows,
-        )
-    )
-    rows.extend(
-        load_local_jsonl(
-            "slai_feedback_log.jsonl",
-            "feedback",
-            min_alpha_ratio=args.quality_min_alpha_ratio,
-            max_chars=args.quality_max_chars,
-            max_rows=args.max_feedback_rows,
-        )
-    )
-    rows.extend(
-        load_local_jsonl(
-            "self_learning_memory.jsonl",
-            "self_learning",
-            min_alpha_ratio=args.quality_min_alpha_ratio,
-            max_chars=args.quality_max_chars,
-            max_rows=args.max_self_learning_rows,
-        )
-    )
+    rows.extend(local_train_rows)
+    source_counts["local_sft_train"] = len(local_train_rows)
 
+    local_valid_rows = load_local_jsonl(
+        "data/slai_sft_valid.jsonl",
+        "local_sft_valid",
+        min_alpha_ratio=args.quality_min_alpha_ratio,
+        max_chars=args.quality_max_chars,
+        max_rows=args.max_local_valid_rows,
+    )
+    rows.extend(local_valid_rows)
+    source_counts["local_sft_valid"] = len(local_valid_rows)
+
+    feedback_rows = load_local_jsonl(
+        "slai_feedback_log.jsonl",
+        "feedback",
+        min_alpha_ratio=args.quality_min_alpha_ratio,
+        max_chars=args.quality_max_chars,
+        max_rows=args.max_feedback_rows,
+    )
+    rows.extend(feedback_rows)
+    source_counts["feedback"] = len(feedback_rows)
+
+    self_learning_rows = load_local_jsonl(
+        "self_learning_memory.jsonl",
+        "self_learning",
+        min_alpha_ratio=args.quality_min_alpha_ratio,
+        max_chars=args.quality_max_chars,
+        max_rows=args.max_self_learning_rows,
+    )
+    rows.extend(self_learning_rows)
+    source_counts["self_learning"] = len(self_learning_rows)
+
+    before_dedupe = len(rows)
     rows = dedupe(rows)
+    after_dedupe = len(rows)
+    source_summary = ", ".join(f"{k}={v}" for k, v in source_counts.items() if v > 0)
+    if source_summary:
+        print(f"[dataset] accepted rows by source: {source_summary}")
+    if after_dedupe != before_dedupe:
+        print(f"[dataset] dedupe removed {before_dedupe - after_dedupe} duplicate rows.")
+
     if args.max_local_rows > 0:
         rows = rows[: args.max_local_rows]
     if len(rows) < 100:
@@ -394,6 +422,11 @@ def train(args):
         )
 
     random.shuffle(rows)
+    if len(rows) < 2000:
+        print(
+            f"[train] warning: only {len(rows)} total rows after filtering/dedupe; "
+            "expect limited generalization and higher valid loss."
+        )
     valid_size = max(64, int(len(rows) * args.valid_ratio))
     valid_size = min(valid_size, max(1, len(rows) - 1))
     valid_rows = rows[:valid_size]
@@ -498,10 +531,19 @@ def train(args):
 
     write_running_summary(status="running")
 
+    resumed_compatibly = False
     if args.resume and model_path.exists():
         try:
             checkpoint = torch.load(model_path, map_location=device)
             state_dict = checkpoint.get("model_state", checkpoint)
+            matched, total, ratio = checkpoint_compatibility(model, state_dict)
+            if ratio < 0.80:
+                print(
+                    f"[train] resume skipped: incompatible checkpoint in {model_path.name} "
+                    f"(matched {matched}/{total} tensors). Starting fresh for current architecture."
+                )
+                checkpoint = None
+                state_dict = {}
             loaded_count, skipped = load_compatible_state(model, state_dict)
             model_tensor_count = len(model.state_dict())
             if loaded_count == 0:
@@ -514,10 +556,12 @@ def train(args):
                 if full_model_match and isinstance(checkpoint, dict) and checkpoint.get("optimizer_state"):
                     try:
                         optimizer.load_state_dict(checkpoint["optimizer_state"])
+                        resumed_compatibly = True
                     except Exception:
                         pass
                 else:
                     print("[train] optimizer state reset for safety (partial/incompatible resume).")
+                    resumed_compatibly = full_model_match
         except Exception as exc:
             print(f"[train] resume failed ({exc}); starting fresh.")
 
@@ -529,9 +573,18 @@ def train(args):
 
     # Initialize best metrics from existing best checkpoint when available.
     best_source = best_model_path if best_model_path.exists() else model_path
+    baseline_compatible = False
     if best_source.exists():
         try:
             previous_best = torch.load(best_source, map_location="cpu")
+            prev_state = previous_best.get("model_state", previous_best)
+            matched, total, ratio = checkpoint_compatibility(model, prev_state)
+            if ratio < 0.80:
+                print(
+                    f"[train] baseline best ignored from {best_source.name}: "
+                    f"incompatible architecture (matched {matched}/{total} tensors)."
+                )
+                previous_best = {}
             prev_valid = previous_best.get("valid_loss")
             prev_epoch = previous_best.get("epoch")
             if isinstance(prev_valid, (int, float)):
@@ -539,6 +592,7 @@ def train(args):
                 if isinstance(prev_epoch, int):
                     best_epoch = int(prev_epoch)
                 print(f"[train] baseline best loaded from {best_source.name}: epoch={best_epoch}, valid_loss={best_valid:.4f}")
+                baseline_compatible = True
         except Exception:
             pass
 
@@ -559,7 +613,12 @@ def train(args):
                 y = y.to(device)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     logits, _ = model(x)
-                    loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), y.reshape(-1), ignore_index=0)
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, logits.shape[-1]),
+                        y.reshape(-1),
+                        ignore_index=0,
+                        label_smoothing=args.label_smoothing,
+                    )
                     loss = loss / max(1, args.grad_accum_steps)
 
                 scaler.scale(loss).backward()
@@ -683,7 +742,7 @@ def train(args):
         print("[train] interrupted by user (KeyboardInterrupt).")
     finally:
         # Ensure model.pt points to best-known checkpoint even after interruption.
-        if best_model_path.exists():
+        if best_model_path.exists() and (baseline_compatible or best_epoch > 0):
             try:
                 shutil.copy2(best_model_path, model_path)
                 print(f"[train] restored best checkpoint to {model_path.name} from {best_model_path.name}")
@@ -718,8 +777,8 @@ def parse_args():
     parser.add_argument("--max-feedback-rows", type=int, default=0, help="Cap rows loaded from slai_feedback_log.jsonl (0 means no cap).")
     parser.add_argument("--max-self-learning-rows", type=int, default=0, help="Cap rows loaded from self_learning_memory.jsonl (0 means no cap).")
     parser.add_argument("--helpsteer-min-score", type=float, default=3.0)
-    parser.add_argument("--quality-min-alpha-ratio", type=float, default=0.45, help="Lower to keep more multilingual/noisy samples.")
-    parser.add_argument("--quality-max-chars", type=int, default=900, help="Max chars per instruction/response pair.")
+    parser.add_argument("--quality-min-alpha-ratio", type=float, default=0.35, help="Lower to keep more multilingual/noisy samples.")
+    parser.add_argument("--quality-max-chars", type=int, default=1600, help="Max chars per instruction/response pair.")
     parser.add_argument("--valid-ratio", type=float, default=0.05)
     parser.add_argument("--profile", choices=["balanced", "2b_like"], default="balanced")
     parser.add_argument("--seq-len", type=int, default=192)
@@ -727,6 +786,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--label-smoothing", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--emb-dim", type=int, default=192)
     parser.add_argument("--hidden-dim", type=int, default=384)
@@ -758,10 +818,14 @@ def parse_args():
         args.hidden_dim = max(args.hidden_dim, 640)
         args.num_layers = max(args.num_layers, 3)
         args.seq_len = max(args.seq_len, 192)
-        args.epochs = max(args.epochs, 6)
+        args.epochs = max(args.epochs, 4)
         args.batch_size = min(args.batch_size, 8)
-        args.grad_accum_steps = max(args.grad_accum_steps, 3)
-        args.lr = min(args.lr, 1.0e-3)
+        args.grad_accum_steps = max(args.grad_accum_steps, 2)
+        args.lr = min(args.lr, 7.5e-4)
+        args.weight_decay = max(args.weight_decay, 0.03)
+        args.dropout = max(args.dropout, 0.2)
+        args.label_smoothing = max(args.label_smoothing, 0.05)
+        args.valid_ratio = max(args.valid_ratio, 0.10)
         args.resume = True
         args.mixed_precision = True
         args.top_k = max(args.top_k, 60)
