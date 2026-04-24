@@ -1,5 +1,4 @@
 import argparse
-import importlib
 import json
 import math
 import queue
@@ -21,15 +20,19 @@ FEEDBACK_LOG_FILE = Path("slai_feedback_log.jsonl")
 SELF_LEARNING_FILE = Path("self_learning_memory.jsonl")
 REMINDER_FILE = Path("reminders.json")
 COGNITIVE_STATE_FILE = Path("cognitive_state.json")
+HYBRID_BRAIN_STATE_FILE = Path("hybrid_brain_state.json")
 DEFAULT_TIMEZONE = "Asia/Kolkata"
 RUNTIME_BACKEND = "nn"
 LOCAL_ENGINE = None
 ENABLE_COGNITIVE_LOOP = True
+ENABLE_HYBRID_BRAIN = True
 ENABLE_AUTONOMOUS_CYCLES = True
 AUTONOMOUS_MIN_TICK_SECONDS = 5
 AUTONOMOUS_GOAL_NUDGE_MINUTES = 15
 LOW_RESOURCE_MODE = False
 SELF_LEARNING_MAX_ROWS = 5000
+FEEDBACK_LOG_MAX_ROWS = 5000
+HYBRID_EPISODIC_MAX_ROWS = 300
 
 STATE_LOCK = threading.RLock()
 PRINT_LOCK = threading.Lock()
@@ -151,206 +154,6 @@ Rules:
 VALID_MEMORY_KEY = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 GENERIC_MEMORY_KEYS = {"key", "value", "fact", "memory", "field", "data", "user_fact"}
 LEGACY_VALUE_PATTERN = re.compile(r"^\s*([^,=]+)\s*,\s*value\s*=\s*(.+)\s*$", re.IGNORECASE)
-
-
-class LocalLoraEngine:
-    def __init__(self, base_model_id, adapter_path, hf_token=None, max_new_tokens=220):
-        import torch
-        from peft import PeftModel
-        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
-        self.base_model_id = base_model_id
-        self.adapter_path = Path(adapter_path)
-        self.max_new_tokens = max_new_tokens
-        self.temperature = 0.7
-        self.top_p = 0.9
-        self.torch = torch
-
-        if not self.adapter_path.exists():
-            raise FileNotFoundError(f"LoRA adapter path not found: {self.adapter_path}")
-
-        tokenizer_source = self.adapter_path if (self.adapter_path / "tokenizer_config.json").exists() else base_model_id
-        tokenizer_kwargs = {}
-        if hf_token:
-            tokenizer_kwargs["token"] = hf_token
-
-        tokenizer_error = None
-        self.tokenizer = None
-        for local_files_only in (True, False):
-            try:
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    str(tokenizer_source),
-                    local_files_only=local_files_only,
-                    **tokenizer_kwargs,
-                )
-                break
-            except Exception as exc:
-                tokenizer_error = exc
-        if self.tokenizer is None:
-            raise RuntimeError(f"Failed to load tokenizer for {tokenizer_source}: {tokenizer_error}")
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        model_kwargs = {"device_map": "auto", "trust_remote_code": False}
-        if hf_token:
-            model_kwargs["token"] = hf_token
-        if torch.cuda.is_available():
-            compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=compute_dtype,
-            )
-
-        model_error = None
-        base_model = None
-        for local_files_only in (True, False):
-            try:
-                base_model = AutoModelForCausalLM.from_pretrained(
-                    base_model_id,
-                    local_files_only=local_files_only,
-                    **model_kwargs,
-                )
-                break
-            except Exception as exc:
-                model_error = exc
-        if base_model is None:
-            raise RuntimeError(f"Failed to load base model {base_model_id}: {model_error}")
-        self.model = PeftModel.from_pretrained(base_model, str(self.adapter_path))
-        self.model.eval()
-        self.input_device = next(self.model.parameters()).device
-
-    def chat(self, messages, response_format=None):
-        prompt_messages = list(messages)
-        if response_format == "json":
-            prompt_messages = [
-                {"role": "system", "content": "Return only valid JSON. Do not include markdown."},
-                *prompt_messages,
-            ]
-
-        prompt_text = self.tokenizer.apply_chat_template(
-            prompt_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        inputs = self.tokenizer(prompt_text, return_tensors="pt")
-        inputs = {k: v.to(self.input_device) for k, v in inputs.items()}
-
-        gen_kwargs = {
-            "max_new_tokens": self.max_new_tokens,
-            "pad_token_id": self.tokenizer.pad_token_id,
-            "eos_token_id": self.tokenizer.eos_token_id,
-        }
-        if response_format == "json":
-            gen_kwargs["do_sample"] = False
-        else:
-            gen_kwargs.update(
-                {
-                    "do_sample": True,
-                    "temperature": self.temperature,
-                    "top_p": self.top_p,
-                }
-            )
-
-        with self.torch.inference_mode():
-            output = self.model.generate(**inputs, **gen_kwargs)
-
-        new_tokens = output[0][inputs["input_ids"].shape[-1] :]
-        content = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-        return {"message": {"content": content}}
-
-
-class AlphaNNEngine:
-    def __init__(
-        self,
-        alpha_root,
-        train_jsonl=None,
-        auto_train=False,
-        train_epochs=8,
-        deterministic=False,
-        min_similarity=0.05,
-    ):
-        self.alpha_root = Path(alpha_root).resolve()
-        if not self.alpha_root.exists():
-            raise FileNotFoundError(f"Alpha root not found: {self.alpha_root}")
-
-        self.train_jsonl = Path(train_jsonl).resolve() if train_jsonl else (self.alpha_root / "data" / "train.jsonl")
-        self.auto_train = bool(auto_train)
-        self.train_epochs = max(1, int(train_epochs))
-        self.deterministic = bool(deterministic)
-        self.min_similarity = float(min_similarity)
-        self.model_label = f"alpha-nn ({self.alpha_root})"
-
-        alpha_root_text = str(self.alpha_root)
-        if alpha_root_text not in sys.path:
-            sys.path.insert(0, alpha_root_text)
-
-        try:
-            self.trainer = importlib.import_module("brain.trainer")
-        except Exception as exc:
-            raise RuntimeError(f"Failed to import Alpha trainer from {self.alpha_root}: {exc}")
-
-        self._configure_trainer_paths()
-
-        if self.auto_train and not self._is_trained():
-            self.train(self.train_jsonl, epochs=self.train_epochs)
-
-    def _configure_trainer_paths(self):
-        train_dir = self.alpha_root / "memory" / "trained"
-        self.trainer.TRAIN_DIR = train_dir
-        self.trainer.MODEL_FILE = train_dir / "model.pth"
-        self.trainer.REPLIES_FILE = train_dir / "replies.json"
-        self.trainer.REPLY_EMBS_FILE = train_dir / "reply_embs.json"
-
-    def _is_trained(self):
-        return self.trainer.MODEL_FILE.exists() and self.trainer.REPLIES_FILE.exists()
-
-    def train(self, dataset_path, epochs=8):
-        dataset = Path(dataset_path).resolve()
-        if not dataset.exists():
-            raise FileNotFoundError(f"Alpha dataset not found: {dataset}")
-        result = self.trainer.train_from_jsonl(str(dataset), epochs=max(1, int(epochs)))
-        return result
-
-    def _extract_user_text(self, messages):
-        for item in reversed(messages):
-            if item.get("role") == "user":
-                return str(item.get("content", "")).strip()
-        return ""
-
-    def _fallback_reply(self, text):
-        lower = text.lower()
-        if not lower:
-            return "I am ready."
-        if any(token in lower for token in ("hi", "hello", "hey")):
-            return "Hello, I am running in Alpha neural mode."
-        if "time" in lower:
-            zone_name = get_user_timezone()
-            return f"It's {format_time(now_in_user_timezone(zone_name), zone_name)}."
-        return (
-            "I am in Alpha neural mode. I need more training examples to answer that well."
-        )
-
-    def chat(self, messages, response_format=None):
-        user_text = self._extract_user_text(messages)
-
-        if response_format == "json":
-            payload = {"store": False}
-            return {"message": {"content": json.dumps(payload)}}
-
-        try:
-            reply = self.trainer.predict_reply(
-                user_text,
-                deterministic=self.deterministic,
-                min_similarity=self.min_similarity,
-            )
-        except Exception:
-            reply = None
-
-        if not reply:
-            reply = self._fallback_reply(user_text)
-        return {"message": {"content": str(reply).strip()}}
 
 
 class TextToSpeechEngine:
@@ -1567,6 +1370,174 @@ def build_cognitive_context():
     )
 
 
+def default_hybrid_brain_state():
+    return {
+        "focus": {"intent": "unknown", "active_goal": None, "updated_utc": ""},
+        "open_tasks": [],
+        "episodic_memory": [],
+        "last_actions": [],
+        "meta": {"version": "phase1"},
+    }
+
+
+def load_hybrid_brain_state():
+    with STATE_LOCK:
+        if not HYBRID_BRAIN_STATE_FILE.exists():
+            return default_hybrid_brain_state()
+        try:
+            with HYBRID_BRAIN_STATE_FILE.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (json.JSONDecodeError, OSError):
+            return default_hybrid_brain_state()
+        if not isinstance(data, dict):
+            return default_hybrid_brain_state()
+
+        state = default_hybrid_brain_state()
+        focus = data.get("focus", {})
+        if isinstance(focus, dict):
+            state["focus"] = {
+                "intent": str(focus.get("intent", "unknown")).strip() or "unknown",
+                "active_goal": focus.get("active_goal"),
+                "updated_utc": str(focus.get("updated_utc", "")),
+            }
+
+        open_tasks = data.get("open_tasks", [])
+        if isinstance(open_tasks, list):
+            normalized = []
+            for item in open_tasks:
+                if not isinstance(item, dict):
+                    continue
+                title = re.sub(r"\s+", " ", str(item.get("title", "")).strip())
+                if not title:
+                    continue
+                normalized.append(
+                    {
+                        "id": str(item.get("id", ""))[:40],
+                        "title": title[:180],
+                        "status": str(item.get("status", "open")).strip().lower() or "open",
+                        "source": str(item.get("source", "hybrid")).strip() or "hybrid",
+                        "updated_utc": str(item.get("updated_utc", "")),
+                    }
+                )
+            state["open_tasks"] = normalized[:60]
+
+        episodic = data.get("episodic_memory", [])
+        if isinstance(episodic, list):
+            state["episodic_memory"] = [item for item in episodic if isinstance(item, dict)][-HYBRID_EPISODIC_MAX_ROWS:]
+
+        last_actions = data.get("last_actions", [])
+        if isinstance(last_actions, list):
+            state["last_actions"] = [str(item).strip() for item in last_actions if str(item).strip()][:10]
+        return state
+
+
+def save_hybrid_brain_state(state):
+    with STATE_LOCK:
+        temp_file = HYBRID_BRAIN_STATE_FILE.with_suffix(".tmp")
+        with temp_file.open("w", encoding="utf-8") as handle:
+            json.dump(state, handle, indent=2, ensure_ascii=False)
+        temp_file.replace(HYBRID_BRAIN_STATE_FILE)
+
+
+def _extract_task_hint(user_input):
+    text = str(user_input or "").strip()
+    lowered = text.lower()
+    if not text:
+        return None
+    if any(kw in lowered for kw in ("todo", "to-do", "task", "remind me to", "plan for")):
+        return text[:180]
+    return None
+
+
+def run_hybrid_brain_cycle(user_input, history, memory_context):
+    if not ENABLE_HYBRID_BRAIN:
+        return {}
+
+    planner = run_cognitive_cycle(user_input, history, memory_context) if ENABLE_COGNITIVE_LOOP else {
+        "intent": infer_intent_heuristic(user_input),
+        "next_actions": [],
+        "risk_flags": [],
+    }
+
+    state = load_hybrid_brain_state()
+    now = datetime.now(timezone.utc).isoformat()
+    cognitive_state = load_cognitive_state()
+    active_goal_id = cognitive_state.get("active_goal_id")
+    active_goal = None
+    if active_goal_id:
+        active_goal = next((item for item in cognitive_state.get("goals", []) if item.get("id") == active_goal_id), None)
+
+    task_hint = _extract_task_hint(user_input)
+    if task_hint:
+        existing = next((task for task in state["open_tasks"] if task["title"].lower() == task_hint.lower()), None)
+        if existing:
+            existing["updated_utc"] = now
+        else:
+            state["open_tasks"].append(
+                {
+                    "id": f"t_{int(datetime.now(timezone.utc).timestamp() * 1000)}",
+                    "title": task_hint,
+                    "status": "open",
+                    "source": "user",
+                    "updated_utc": now,
+                }
+            )
+            state["open_tasks"] = state["open_tasks"][-60:]
+
+    state["focus"] = {
+        "intent": str(planner.get("intent", "unknown")).strip() or "unknown",
+        "active_goal": active_goal["title"] if active_goal else None,
+        "updated_utc": now,
+    }
+    state["last_actions"] = [str(item).strip() for item in planner.get("next_actions", []) if str(item).strip()][:5]
+    state["episodic_memory"].append(
+        {
+            "timestamp_utc": now,
+            "user": str(user_input)[:240],
+            "intent": state["focus"]["intent"],
+            "risk_flags": [str(item).strip() for item in planner.get("risk_flags", []) if str(item).strip()][:3],
+            "actions": state["last_actions"][:3],
+        }
+    )
+    state["episodic_memory"] = state["episodic_memory"][-HYBRID_EPISODIC_MAX_ROWS:]
+    save_hybrid_brain_state(state)
+    return planner
+
+
+def build_hybrid_brain_context():
+    if not ENABLE_HYBRID_BRAIN:
+        return ""
+
+    state = load_hybrid_brain_state()
+    focus = state.get("focus", {})
+    intent = str(focus.get("intent", "unknown")).strip() or "unknown"
+    active_goal = str(focus.get("active_goal") or "None").strip()
+    open_tasks = state.get("open_tasks", [])
+    open_count = len([task for task in open_tasks if str(task.get("status", "open")).lower() == "open"])
+
+    recent = state.get("episodic_memory", [])[-3:]
+    recent_lines = []
+    for item in recent:
+        user_text = str(item.get("user", "")).strip()
+        item_intent = str(item.get("intent", "unknown")).strip()
+        if user_text:
+            recent_lines.append(f"- intent={item_intent}; user='{user_text[:120]}'")
+    recent_text = "\n".join(recent_lines) if recent_lines else "- None"
+
+    actions = state.get("last_actions", [])
+    actions_text = "; ".join(actions[:3]) if actions else "None"
+    return (
+        "Hybrid brain context:\n"
+        f"- Focus intent: {intent}\n"
+        f"- Active goal: {active_goal}\n"
+        f"- Open tasks: {open_count}\n"
+        f"- Suggested actions: {actions_text}\n"
+        "- Recent episodes:\n"
+        f"{recent_text}\n"
+        "- Stay consistent with this state, and do not invent hidden actions."
+    )
+
+
 def run_autonomous_goal_nudge(now_utc):
     if not ENABLE_COGNITIVE_LOOP:
         return None
@@ -1736,6 +1707,35 @@ def extract_wake_word_command(user_input):
     return None
 
 
+def extract_brain_command(user_input):
+    text = user_input.strip().lower()
+    if re.fullmatch(r"(?:show\s+)?brain\s+status", text):
+        return "status"
+    return None
+
+
+def format_hybrid_brain_status():
+    state = load_hybrid_brain_state()
+    focus = state.get("focus", {})
+    intent = str(focus.get("intent", "unknown")).strip() or "unknown"
+    active_goal = str(focus.get("active_goal") or "None").strip()
+    open_tasks = [item for item in state.get("open_tasks", []) if str(item.get("status", "open")).lower() == "open"]
+    recent = state.get("episodic_memory", [])[-3:]
+
+    lines = [
+        f"Hybrid brain intent: {intent}",
+        f"Active goal: {active_goal}",
+        f"Open tasks: {len(open_tasks)}",
+    ]
+    if recent:
+        lines.append("Recent episodes:")
+        for item in recent:
+            user_text = str(item.get("user", "")).strip()
+            if user_text:
+                lines.append(f"- {user_text[:100]}")
+    return "\n".join(lines)
+
+
 def handle_utility_request(user_input):
     global WAKE_WORD_ENABLED
 
@@ -1772,6 +1772,10 @@ def handle_utility_request(user_input):
     if wake_cmd == "disable":
         WAKE_WORD_ENABLED = False
         return True, "Wake word disabled."
+
+    brain_cmd = extract_brain_command(user_input)
+    if brain_cmd == "status":
+        return True, format_hybrid_brain_status()
 
     timezone_change = extract_timezone_change_request(user_input)
     if timezone_change:
@@ -1867,10 +1871,95 @@ def normalize_learning_text(value, max_length=500):
     return text[:max_length]
 
 
+def trim_jsonl_file(path, max_rows):
+    max_rows = max(1, int(max_rows))
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    if len(lines) <= max_rows:
+        return
+    trimmed = lines[-max_rows:]
+    try:
+        path.write_text("\n".join(trimmed) + "\n", encoding="utf-8")
+    except OSError:
+        return
+
+
+def _tokenize_for_learning(value):
+    return re.findall(r"[a-z0-9]+", str(value or "").lower())
+
+
+def _looks_like_time_reply(reply_text):
+    lower = str(reply_text or "").lower()
+    if "it's " in lower and "ist" in lower:
+        return True
+    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", lower):
+        return True
+    return False
+
+
+def _is_time_question(prompt_text):
+    lower = str(prompt_text or "").lower()
+    return any(
+        phrase in lower
+        for phrase in (
+            "what time",
+            "current time",
+            "time is it",
+            "timezone",
+            "time zone",
+            "date and time",
+        )
+    )
+
+
+def is_self_learning_pair_valid(prompt, reply, source="chat"):
+    prompt_text = str(prompt or "").strip()
+    reply_text = str(reply or "").strip()
+    if not prompt_text or not reply_text:
+        return False
+
+    if len(prompt_text) < 3 or len(reply_text) < 3:
+        return False
+
+    if re.search(r"(.)\1{10,}", reply_text):
+        return False
+
+    lower_reply = reply_text.lower()
+    if lower_reply.startswith("error:") or "failed to" in lower_reply:
+        return False
+
+    if _looks_like_time_reply(reply_text) and not _is_time_question(prompt_text):
+        return False
+
+    # Reject obviously garbled/meta spills.
+    bad_phrases = [
+        "hello chatgpt",
+        "tool reception",
+        "specific needs and budget",
+    ]
+    if any(phrase in lower_reply for phrase in bad_phrases):
+        return False
+
+    # Keep only examples with at least weak lexical relevance in free-form chat.
+    if str(source).lower() == "chat":
+        p_tokens = set(_tokenize_for_learning(prompt_text))
+        r_tokens = set(_tokenize_for_learning(reply_text))
+        if len(p_tokens) >= 3:
+            overlap = len(p_tokens & r_tokens) / float(max(1, len(p_tokens | r_tokens)))
+            if overlap < 0.03 and not _is_time_question(prompt_text):
+                return False
+
+    return True
+
+
 def append_self_learning_example(user_input, final_reply, source="chat"):
     prompt = normalize_learning_text(user_input, max_length=500)
     reply = normalize_learning_text(final_reply, max_length=700)
     if not prompt or not reply:
+        return
+    if not is_self_learning_pair_valid(prompt, reply, source=source):
         return
 
     record = {
@@ -1882,15 +1971,6 @@ def append_self_learning_example(user_input, final_reply, source="chat"):
     with STATE_LOCK:
         with SELF_LEARNING_FILE.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-        # Keep only latest rows to cap file growth.
-        try:
-            rows = SELF_LEARNING_FILE.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            return
-        if len(rows) > SELF_LEARNING_MAX_ROWS:
-            rows = rows[-SELF_LEARNING_MAX_ROWS:]
-            SELF_LEARNING_FILE.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
 def load_self_learning_examples(limit=800):
@@ -1914,6 +1994,8 @@ def load_self_learning_examples(limit=800):
         instruction = normalize_learning_text(item.get("instruction", ""), max_length=500)
         response = normalize_learning_text(item.get("response", ""), max_length=700)
         if not instruction or not response:
+            continue
+        if not is_self_learning_pair_valid(instruction, response, source=item.get("source", "chat")):
             continue
         rows.append({"instruction": instruction, "response": response})
         if len(rows) >= limit:
@@ -1959,7 +2041,13 @@ def build_runtime_clock_context():
     )
 
 
-def load_system_prompt(memory_context, runtime_clock_context="", cognitive_context="", self_learning_context=""):
+def load_system_prompt(
+    memory_context,
+    runtime_clock_context="",
+    cognitive_context="",
+    hybrid_context="",
+    self_learning_context="",
+):
     with open("system_prompt.txt", "r", encoding="utf-8") as f:
         prompt = f.read()
     prompt = prompt.replace("{memory_context}", memory_context)
@@ -1968,6 +2056,8 @@ def load_system_prompt(memory_context, runtime_clock_context="", cognitive_conte
         extras.append(runtime_clock_context)
     if cognitive_context:
         extras.append(cognitive_context)
+    if hybrid_context:
+        extras.append(hybrid_context)
     if self_learning_context:
         extras.append(self_learning_context)
     if extras:
@@ -2147,8 +2237,10 @@ def append_feedback_log(user_input, draft_reply, final_reply, review_data):
         "final_reply": final_reply,
         "review": review_data,
     }
-    with FEEDBACK_LOG_FILE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    with STATE_LOCK:
+        with FEEDBACK_LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        trim_jsonl_file(FEEDBACK_LOG_FILE, FEEDBACK_LOG_MAX_ROWS)
 
 
 def trim_history(messages, max_turns):
@@ -2224,15 +2316,19 @@ def main():
                     memory.add_fact(memory_fact[0], memory_fact[1])
 
                 memory_context = memory.get_memory_context()
-                if ENABLE_COGNITIVE_LOOP:
+                if ENABLE_HYBRID_BRAIN:
+                    run_hybrid_brain_cycle(user_input, history, memory_context)
+                elif ENABLE_COGNITIVE_LOOP:
                     run_cognitive_cycle(user_input, history, memory_context)
                 runtime_clock_context = build_runtime_clock_context()
                 cognitive_context = build_cognitive_context() if ENABLE_COGNITIVE_LOOP else ""
+                hybrid_context = build_hybrid_brain_context() if ENABLE_HYBRID_BRAIN else ""
                 self_learning_context = build_self_learning_context(user_input)
                 system_prompt = load_system_prompt(
                     memory_context,
                     runtime_clock_context=runtime_clock_context,
                     cognitive_context=cognitive_context,
+                    hybrid_context=hybrid_context,
                     self_learning_context=self_learning_context,
                 )
 

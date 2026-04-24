@@ -531,7 +531,6 @@ def train(args):
 
     write_running_summary(status="running")
 
-    resumed_compatibly = False
     if args.resume and model_path.exists():
         try:
             checkpoint = torch.load(model_path, map_location=device)
@@ -556,12 +555,10 @@ def train(args):
                 if full_model_match and isinstance(checkpoint, dict) and checkpoint.get("optimizer_state"):
                     try:
                         optimizer.load_state_dict(checkpoint["optimizer_state"])
-                        resumed_compatibly = True
                     except Exception:
                         pass
                 else:
                     print("[train] optimizer state reset for safety (partial/incompatible resume).")
-                    resumed_compatibly = full_model_match
         except Exception as exc:
             print(f"[train] resume failed ({exc}); starting fresh.")
 
@@ -720,6 +717,7 @@ def train(args):
                 args.target_valid_loss is not None
                 and epoch >= args.min_epochs_before_stop
                 and valid_loss <= float(args.target_valid_loss)
+                and (best_valid == float("inf") or valid_loss <= best_valid)
             ):
                 stop_reason = f"target_valid_loss_reached({valid_loss:.4f}<={args.target_valid_loss})"
                 print(f"[train] early stop triggered: {stop_reason}")
